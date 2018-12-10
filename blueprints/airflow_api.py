@@ -11,7 +11,9 @@ from airflow.exceptions import AirflowException, AirflowConfigException
 from airflow.models import DagBag, DagRun
 from airflow.utils.state import State
 from airflow.utils.dates import date_range as utils_date_range
+from airflow.utils import timezone
 from airflow.www.app import csrf
+from airflow.api.common.experimental.get_task_instance import get_task_instance
 
 airflow_api_blueprint = Blueprint('airflow_api', __name__, url_prefix='/api/v1')
 
@@ -86,6 +88,19 @@ def format_dag_run(dag_run):
         'end_date': (None if not dag_run.end_date else str(dag_run.end_date)),
         'external_trigger': dag_run.external_trigger,
         'execution_date': str(dag_run.execution_date)
+    }
+
+
+def format_task_instance(task_ins_obj):
+    return {
+        'task_id': task_ins_obj.task_id,
+        'dag_id': task_ins_obj.dag_id,
+        'state': task_ins_obj.state,
+        'start_date': (None if not task_ins_obj.start_date else
+                       str(task_ins_obj.start_date)),
+        'end_date': (None if not task_ins_obj.end_date else
+                     str(task_ins_obj.end_date)),
+        'execution_date': str(task_ins_obj.execution_date)
     }
 
 
@@ -249,14 +264,18 @@ def create_dag_run():
             if len(results) >= limit:
                 break
 
-            dag.create_dagrun(
+            dro = dag.create_dagrun(
                 run_id=run['run_id'],
                 execution_date=run['execution_date'],
                 state=State.RUNNING,
                 conf=conf,
                 external_trigger=True
             )
-            results.append(run['run_id'])
+
+            if "detailed_output" in data :
+                results.append(format_dag_run(dro))
+            else:
+                results.append(run['run_id'])
 
         session.close()
     except ApiInputException as e:
@@ -286,16 +305,18 @@ def get_dag_run(dag_run_id):
 
     return ApiResponse.success({'dag_run': format_dag_run(dag_run)})
 
-# When using a subdagoperator if a downstream task fails this method still returns the status of the run_id as running
-# However in the dashboard the main dag will show that as a failure. Adding the dag_name will resolve this
 
 @airflow_api_blueprint.route('/dags/dag_runs/', methods=['GET'])
 def get_dag_run_with_dag():
+    """ When using a subdagoperator if a downstream task fails
+        this method still returns the status of the run_id as running
+        However in the dashboard the main dag will show that as a failure.
+        Adding the dag_name will resolve this"""
     session = settings.Session()
     run_id=request.args.get('run_id')
     dag_id=request.args.get('dag_id')
 
-    runs = DagRun.find(dag_id=dag_id , run_id=run_id, session=session)
+    runs = DagRun.find(dag_id=dag_id, run_id=run_id, session=session)
 
     if len(runs) == 0:
         return ApiResponse.not_found('Dag run not found')
@@ -305,3 +326,20 @@ def get_dag_run_with_dag():
     session.close()
 
     return ApiResponse.success({'dag_run': format_dag_run(dag_run)})
+
+
+@airflow_api_blueprint.route('/dags/<dag_id>/dag_runs/<task_id>',
+                             methods=['GET'])
+def get_task_instance_details(dag_id, task_id):
+    """ Fetches the task instance details"""
+    try:
+        execution_date = request.args.get('execution_date',None)
+        execution_date = timezone.parse(execution_date)
+    except ValueError as ve:
+        return ApiResponse.bad_request(str(ve))
+
+    try:
+        info = get_task_instance(dag_id, task_id, execution_date)
+    except AirflowException as err:
+        return ApiResponse.server_error(str(err))
+    return ApiResponse.success(format_task_instance(info))
